@@ -34,11 +34,11 @@ CREATE TABLE projects (
     name            VARCHAR(255) NOT NULL,
     created_by      BIGINT       NOT NULL REFERENCES users(id),
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    deleted_at      TIMESTAMPTZ                       -- 软删除
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    -- [FIXED S8] 去掉 deleted_at，统一硬删除 + 级联。仅 users 表保留软删除
 );
 
-CREATE INDEX idx_projects_list ON projects (deleted_at, updated_at DESC);
+CREATE INDEX idx_projects_list ON projects (updated_at DESC); -- [FIXED S8] 去掉 deleted_at 条件
 
 -- ============================================================================
 -- 3. 季表
@@ -48,6 +48,7 @@ CREATE TABLE seasons (
     project_id      BIGINT       NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     title           VARCHAR(255) NOT NULL,
     sort_order      INT          NOT NULL DEFAULT 0,
+    created_by      BIGINT       NOT NULL REFERENCES users(id), -- [FIXED S1] 补充数据归属追踪
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -64,6 +65,7 @@ CREATE TABLE episodes (
     script_content  TEXT,                              -- 剧本内容（富文本 HTML/Markdown）
     config          JSONB        NOT NULL DEFAULT '{}', -- 项目配置（创作模式、语言、比例、时长、风格等）
     sort_order      INT          NOT NULL DEFAULT 0,
+    created_by      BIGINT       NOT NULL REFERENCES users(id), -- [FIXED S1] 补充数据归属追踪
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -76,19 +78,20 @@ CREATE INDEX idx_episodes_season ON episodes (season_id, sort_order);
 CREATE TABLE storyboard_shots (
     id                BIGINT PRIMARY KEY,
     episode_id        BIGINT       NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-    shot_number       INT          NOT NULL,
-    sort_order        INT          NOT NULL DEFAULT 0,
+    shot_number       INT          NOT NULL,            -- [FIXED S2] 展示用镜号，reorder 时同步重新编号
+    sort_order        INT          NOT NULL DEFAULT 0,  -- [FIXED S2] 纯排序字段，用于 ORDER BY
     scene_description TEXT,
     camera_movement   VARCHAR(64),                     -- 推/拉/摇/移/跟/固定/自定义
     dialogue          TEXT,
     action            TEXT,
-    duration          VARCHAR(16),                     -- 如 "4s"
+    duration_ms       INTEGER      NOT NULL DEFAULT 4000, -- [FIXED B1] 毫秒级精度，方便计算总时长（原 VARCHAR(16) 无法参与数值运算）
     script_prompt     TEXT,
     visual_prompt     TEXT,
     status            VARCHAR(32)  NOT NULL DEFAULT 'pending',  -- pending | processing | completed | failed
     video_url         TEXT,                             -- S3 key
     thumbnail_url     TEXT,                             -- S3 key
     video_config      JSONB        NOT NULL DEFAULT '{}', -- 视频生成参数（模型、比例、时长、配音等）
+    created_by        BIGINT       NOT NULL REFERENCES users(id), -- [FIXED S1] 补充数据归属追踪
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -103,6 +106,7 @@ CREATE TABLE assets (
     id              BIGINT PRIMARY KEY,
     project_id      BIGINT       NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     episode_id      BIGINT       REFERENCES episodes(id) ON DELETE SET NULL,  -- 来源集，可为空（资产库复用）
+    is_library      BOOLEAN      NOT NULL DEFAULT FALSE, -- [FIXED B4] 是否已入资产库（confirmed 后 is_library=true，资产独立存在不依赖分镜）
     type            VARCHAR(32)  NOT NULL,             -- character | scene | prop
     name            VARCHAR(255) NOT NULL,
     description     TEXT,
@@ -111,6 +115,7 @@ CREATE TABLE assets (
     thumbnail_url   TEXT,                              -- S3 key
     status          VARCHAR(32)  NOT NULL DEFAULT 'pending',  -- pending | confirmed
     metadata        JSONB        NOT NULL DEFAULT '{}', -- 附加信息（变体 URL、九宫格 URL 等）
+    created_by      BIGINT       NOT NULL REFERENCES users(id), -- [FIXED S1] 补充数据归属追踪
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -135,7 +140,7 @@ CREATE INDEX idx_shot_assets_asset ON shot_asset_relations (asset_id);
 -- ============================================================================
 CREATE TABLE tasks (
     id              BIGINT PRIMARY KEY,
-    type            VARCHAR(64)  NOT NULL,             -- storyboard_generate | asset_image_generate | video_generate | export_compose | ai_rewrite | ai_continue | ...
+    type            VARCHAR(64)  NOT NULL,             -- [FIXED S7] storyboard_generate | asset_image_generate | video_generate | export_compose（AI 改写/续写/风格反推改为同步 SSE，不走异步队列）
     status          VARCHAR(32)  NOT NULL DEFAULT 'pending',  -- pending | processing | completed | failed
     payload         JSONB        NOT NULL DEFAULT '{}', -- 任务输入参数
     result          JSONB,                             -- 任务输出结果
@@ -208,6 +213,7 @@ CREATE TABLE exports (
     id              BIGINT PRIMARY KEY,
     episode_id      BIGINT       NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
     task_id         BIGINT       REFERENCES tasks(id),
+    status          VARCHAR(32)  NOT NULL DEFAULT 'pending', -- [FIXED S4] 冗余状态字段，避免 JOIN tasks 表 (pending | processing | completed | failed)
     resolution      VARCHAR(16)  NOT NULL DEFAULT '1080p',  -- 720p | 1080p | 4k
     format          VARCHAR(16)  NOT NULL DEFAULT 'mp4',
     file_url        TEXT,                              -- S3 key

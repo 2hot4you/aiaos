@@ -77,7 +77,7 @@
 |------|------|
 | **Clean Architecture** | Handler → Service → Repository 单向依赖，业务逻辑不依赖框架 |
 | **接口隔离** | AI 调用、存储等外部依赖全部通过 interface 抽象 |
-| **异步优先** | 所有 AI 操作走 Redis Stream 异步任务队列 |
+| **异步优先** | 耗时 AI 操作（生图、生视频、成片导出）走 Redis Stream 异步任务队列；短时操作（改写/续写/风格反推）走同步 SSE [FIXED S7] |
 | **共享数据** | 所有用户共享全部项目数据，无用户级数据隔离 |
 | **12-Factor** | 配置走环境变量，无状态服务，容器化部署 |
 
@@ -239,7 +239,7 @@ interface AuthState {
   token: string | null;
   login: (username: string, password: string) => Promise<void>;
   logout: () => void;
-  refreshToken: () => Promise<void>;
+  // [FIXED B3] refreshToken 已移除，JWT 7 天有效期，过期重新登录
 }
 
 // stores/useTaskStore.ts — 管理异步任务状态
@@ -345,7 +345,7 @@ backend/
 │   │   └── redis/                # Redis 实现
 │   │       ├── cache.go          # 通用缓存
 │   │       └── session.go        # 登录失败计数、黑名单
-│   ├── handler/                  # HTTP Handler（Gin/Chi）
+│   ├── handler/                  # HTTP Handler（Gin）[FIXED S9]
 │   │   ├── router.go             # 路由注册
 │   │   ├── auth_handler.go
 │   │   ├── project_handler.go
@@ -391,8 +391,8 @@ backend/
 │   │       ├── storyboard_gen.go # 分镜生成任务
 │   │       ├── image_gen.go      # 图片生成任务
 │   │       ├── video_gen.go      # 视频生成任务
-│   │       ├── export.go         # 导出合成任务
-│   │       └── ai_rewrite.go     # AI 改写/续写任务
+│   │       └── export.go         # 导出合成任务
+│   │       # [FIXED S7] ai_rewrite.go 已移除，改写/续写/风格反推走同步 SSE
 │   └── config/                   # 配置管理
 │       └── config.go             # 环境变量解析
 ├── pkg/                          # 公共工具包
@@ -514,10 +514,11 @@ func main() {
 │ username │     │ name     │     │ project_id│───▶│ season_id      │
 │ display_ │     │ created_ │     │ title    │     │ title          │
 │ password │     │ updated_ │     │ sort_order│    │ script_content │
-│ role     │     │ deleted_ │     │ created_ │     │ config (JSONB) │
-│ enabled  │     └──────────┘     └──────────┘     │ created_at     │
-│ created_ │           │                │           └────────────────┘
-│ last_login│          │                │                  │
+│ role     │     │          │     │ created_by│    │ config (JSONB) │
+│ enabled  │     └──────────┘     │ [FIXED S1]│    │ created_by     │
+│ created_ │           │          │ created_ │     │ [FIXED S1]     │
+│ last_login│          │          └──────────┘     │ created_at     │
+│ deleted_ │           │                │           └────────────────┘
 └──────────┘           │                │                  │
                        │                │                  │
                        ▼                ▼                  ▼
@@ -526,8 +527,9 @@ func main() {
               │──────────────────────────────────────────────────│
               │ id (PK)  │ episode_id  │ shot_number │ sort_order│
               │ scene_description │ camera_movement │ dialogue   │
-              │ action │ duration │ script_prompt │ visual_prompt│
-              │ status │ video_url │ thumbnail_url │ created_at  │
+              │ action │ duration_ms [FIXED B1] │ script_prompt │ visual_prompt│
+              │ status │ video_url │ thumbnail_url │ created_by │
+              │ [FIXED S1] │ created_at                         │
               └──────────────────────────────────────────────────┘
                                        │
                                        ▼
@@ -535,8 +537,9 @@ func main() {
               │                    assets                         │
               │──────────────────────────────────────────────────│
               │ id (PK) │ project_id │ episode_id │ type         │
-              │ name │ description │ image_prompt │ image_url    │
-              │ status │ confirmed │ metadata (JSONB) │ created_ │
+              │ is_library [FIXED B4] │ name │ description  │
+              │ image_prompt │ image_url │ status │ metadata     │
+              │ created_by [FIXED S1]                            │
               └──────────────────────────────────────────────────┘
                                        │
               ┌──────────────────────────────────────────────────┐
@@ -579,7 +582,8 @@ func main() {
 |------|------|
 | **主键策略** | 全部使用 `BIGINT` + Snowflake 算法生成，避免 UUID 索引性能问题 |
 | **时间字段** | 统一 `TIMESTAMPTZ`，使用 UTC 存储 |
-| **软删除** | `users`、`projects` 表有 `deleted_at` 字段 |
+| **时长字段** | `duration_ms` 使用 `INTEGER` 存储毫秒值，便于排序、求和等数值运算 [FIXED B1] |
+| **软删除** | 仅 `users` 表保留 `deleted_at` 软删除；`projects` 及其子表（seasons/episodes/shots/assets）统一硬删除 + 级联 [FIXED S8] |
 | **JSON 字段** | 配置/元数据使用 `JSONB`，便于灵活扩展 |
 | **无用户隔离** | 项目/资产等表不按用户过滤，所有用户共享 |
 | **审计字段** | 所有表包含 `created_at`、`updated_at` |
@@ -589,7 +593,7 @@ func main() {
 | 表 | 索引 | 类型 | 用途 |
 |----|------|------|------|
 | `users` | `username` | UNIQUE | 登录查找 |
-| `projects` | `deleted_at, updated_at` | BTREE | 列表排序 |
+| `projects` | `updated_at DESC` | BTREE | 列表排序 [FIXED S8] |
 | `seasons` | `project_id, sort_order` | BTREE | 项目下季排序 |
 | `episodes` | `season_id` | BTREE | 季下集查找 |
 | `storyboard_shots` | `episode_id, sort_order` | BTREE | 分镜排序 |
@@ -609,7 +613,7 @@ func main() {
 | 项目 | 规范 |
 |------|------|
 | **Base URL** | `/api/v1` |
-| **版本策略** | URL Path 版本控制 (`/api/v1`, `/api/v2`) |
+| **版本策略** | v1 为当前唯一版本。如需 Breaking Change，直接在 v1 上修改，前后端同步发布。暂不考虑多版本共存 [FIXED S10] |
 | **命名风格** | 资源名用复数名词，snake_case |
 | **HTTP 方法** | GET=查, POST=创建/操作, PUT=全量更新, DELETE=删除 |
 | **请求格式** | `Content-Type: application/json` |
@@ -693,8 +697,11 @@ func main() {
 # ── 认证 ──────────────────────────────────────
 POST   /api/v1/auth/login                           # 登录
 POST   /api/v1/auth/logout                          # 登出
-POST   /api/v1/auth/refresh                         # 刷新 Token
 GET    /api/v1/auth/me                               # 当前用户信息
+# [FIXED B3] 去掉 POST /api/v1/auth/refresh，JWT 有效期 7 天，过期重新登录
+
+# ── 用户自助 ──────────────────────────────────
+PUT    /api/v1/users/me/password                     # [FIXED B2] 用户修改自身密码 Body: {old_password, new_password}
 
 # ── 项目 ──────────────────────────────────────
 GET    /api/v1/projects                              # 项目列表（分页、搜索、排序）
@@ -702,7 +709,7 @@ GET    /api/v1/projects/stats                        # 项目统计
 POST   /api/v1/projects                              # 创建项目
 GET    /api/v1/projects/:id                          # 项目详情
 PUT    /api/v1/projects/:id                          # 更新项目
-DELETE /api/v1/projects/:id                          # 删除项目（软删除）
+DELETE /api/v1/projects/:id                          # 删除项目（硬删除 + 级联）[FIXED S8]
 GET    /api/v1/projects/:id/stats                    # 单项目统计
 
 # ── 季 ────────────────────────────────────────
@@ -722,7 +729,7 @@ PUT    /api/v1/episodes/:id/config                   # 保存配置
 # ── 分镜 ──────────────────────────────────────
 POST   /api/v1/episodes/:id/storyboard/generate      # 生成分镜（异步）
 GET    /api/v1/episodes/:id/storyboard               # 分镜列表
-PUT    /api/v1/episodes/:id/storyboard/reorder       # 分镜排序
+PUT    /api/v1/episodes/:id/storyboard/reorder       # [FIXED S2] 分镜排序：同时更新 sort_order（排序）和 shot_number（展示镜号），保持两者同步
 GET    /api/v1/storyboard/:id                        # 分镜详情
 PUT    /api/v1/storyboard/:id                        # 更新分镜
 POST   /api/v1/storyboard/:id/assets                 # 关联资产
@@ -743,9 +750,10 @@ POST   /api/v1/assets/:id/replace                    # 从资产库替换
 GET    /api/v1/asset-library                         # 资产库搜索
 
 # ── AI 工具 ───────────────────────────────────
-POST   /api/v1/ai/rewrite                            # AI 改写
-POST   /api/v1/ai/continue                           # AI 续写
-POST   /api/v1/ai/style-inference                    # 风格反推
+# [FIXED S7] 以下接口走同步 SSE 流式返回，不进异步任务队列
+POST   /api/v1/ai/rewrite                            # AI 改写（SSE 流式）
+POST   /api/v1/ai/continue                           # AI 续写（SSE 流式）
+POST   /api/v1/ai/style-inference                    # 风格反推（SSE 流式）
 
 # ── 任务 ──────────────────────────────────────
 GET    /api/v1/tasks/:id                             # 查询任务状态
@@ -768,7 +776,7 @@ POST   /api/v1/prompts/:id/duplicate                 # 复制提示词
 GET    /api/v1/admin/users                           # 用户列表
 POST   /api/v1/admin/users                           # 创建用户
 PUT    /api/v1/admin/users/:id                       # 更新用户
-DELETE /api/v1/admin/users/:id                       # 删除用户（软删除）
+DELETE /api/v1/admin/users/:id                       # 删除用户（软删除，仅 users 表保留）
 POST   /api/v1/admin/users/:id/reset-password        # 重置密码
 PUT    /api/v1/admin/users/:id/status                # 禁用/启用
 
@@ -782,6 +790,9 @@ GET    /api/v1/admin/settings                        # 获取系统设置
 PUT    /api/v1/admin/settings                        # 更新系统设置
 GET    /api/v1/admin/component-settings              # 获取组件参数
 PUT    /api/v1/admin/component-settings              # 更新组件参数
+
+# ── 健康检查 ──────────────────────────────────
+GET    /healthz                                      # [FIXED S12] 健康检查（检查 DB + Redis 连接状态），无需认证
 ```
 
 ---
@@ -845,7 +856,9 @@ PUT    /api/v1/admin/component-settings              # 更新组件参数
 }
 ```
 
-### 6.4 任务类型
+### 6.4 任务类型 [FIXED S7]
+
+> **变更说明：** AI 改写(`ai_rewrite`)、续写(`ai_continue`)、风格反推(`style_inference`) 已从异步任务队列中移除，改为同步 SSE 流式处理。仅耗时较长的操作走异步队列。
 
 | Type | 说明 | AI Provider | 预计耗时 |
 |------|------|-------------|----------|
@@ -857,9 +870,6 @@ PUT    /api/v1/admin/component-settings              # 更新组件参数
 | `video_generate` | 视频生成 | Sora (生视频) | 30-180s |
 | `video_batch_generate` | 批量视频生成 | Sora (生视频) | N × 30-180s |
 | `export_compose` | 成片合成 | FFmpeg | 60-300s |
-| `ai_rewrite` | AI 改写 | GPT (生文) | 5-15s |
-| `ai_continue` | AI 续写 | GPT (生文) | 5-15s |
-| `style_inference` | 风格反推 | Gemini (生图) | 10-30s |
 
 ### 6.5 任务状态机
 
@@ -910,9 +920,49 @@ SSE Handler → Redis SUBSCRIBE task:{taskId} → EventSource → Client
 | **死信处理** | 超过重试次数的消息移入 `aiaos:tasks:dead` stream |
 | **ACK 机制** | 处理完成后 XACK，未 ACK 的消息会被重新投递 |
 
----
+### 6.8 Redis 缓存策略 [FIXED S6]
 
-## 7. AI 模型调用层
+内部工具初期不做复杂缓存。50 并发场景下 PostgreSQL 完全承受得住。仅缓存以下两类数据：
+
+| 缓存对象 | 策略 | TTL | 更新方式 |
+|----------|------|-----|----------|
+| 登录失败计数 | Redis INCR | 15min | 自动过期 |
+| 账号锁定状态 | Redis SET | 15min | 自动过期 |
+| 系统设置 (`system_settings`) | Cache-Aside | 5min | 写入时主动 DEL key 失效 |
+| AI 模型配置 (`ai_model_configs`) | Cache-Aside | 5min | 写入时主动 DEL key 失效 |
+| 其他业务数据 | **不缓存** | — | 直接查 DB |
+
+**Cache-Aside 伪代码：**
+
+```go
+func (s *SettingService) Get(key string) (*Setting, error) {
+    // 1. 先查 Redis
+    cached, err := s.cache.Get(ctx, "setting:"+key)
+    if err == nil {
+        return cached, nil
+    }
+    // 2. Cache miss → 查 DB
+    setting, err := s.repo.FindByKey(key)
+    if err != nil {
+        return nil, err
+    }
+    // 3. 写入 Cache，TTL 5min
+    s.cache.Set(ctx, "setting:"+key, setting, 5*time.Minute)
+    return setting, nil
+}
+
+func (s *SettingService) Update(key string, value any) error {
+    err := s.repo.Update(key, value)
+    if err != nil {
+        return err
+    }
+    // 写入成功后主动失效缓存
+    s.cache.Del(ctx, "setting:"+key)
+    return nil
+}
+```
+
+---
 
 ### 7.1 统一接口设计
 
@@ -1070,16 +1120,16 @@ func (c *OpenAIClient) GenerateTextSync(ctx context.Context, req *TextRequest) (
 }
 ```
 
-### 7.4 SSE 流式返回（AI 改写/续写）
+### 7.4 同步 SSE 流式返回（AI 改写/续写/风格反推）[FIXED S7]
 
-对于 AI 改写、续写等需要实时反馈的场景，支持 SSE 流式返回：
+> **变更说明：** AI 改写、续写、风格反推走同步 SSE，不经过 Redis Stream 异步任务队列。Handler 直接调用 AI Provider 流式接口，逐 chunk 转发给前端。`tasks` 表中不记录这些短时操作。
 
 ```
 POST /api/v1/ai/rewrite
 Accept: text/event-stream
 
-→ 调用 GPT Stream API
-→ 逐 chunk 转发给前端
+→ Handler 直接调用 AI Provider.GenerateText(stream=true)
+→ 逐 chunk 通过 SSE 返回客户端（不经过 Redis Stream）
 
 event: chunk
 data: {"content": "从前有"}
@@ -1180,7 +1230,9 @@ AI 生成图片/视频 → Worker 调用 AI API 获取二进制
 
 ## 9. 认证授权设计
 
-### 9.1 JWT 设计
+### 9.1 JWT 设计 [FIXED B3]
+
+> **变更说明：** 去掉 Refresh Token 机制，Access Token 有效期延长到 7 天。内部工具场景下，避免 Token 自我刷新的安全隐患，简化认证流程。
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -1195,7 +1247,7 @@ AI 生成图片/视频 → Worker 调用 AI API 获取二进制
 │                                               │
 │  签名算法: HS256                               │
 │  密钥: 环境变量 JWT_SECRET                      │
-│  有效期: 24 小时（可配置）                       │
+│  有效期: 7 天（内部工具场景，过期后重新登录）      │
 └──────────────────────────────────────────────┘
 ```
 
@@ -1380,6 +1432,11 @@ DB_USER=aiaos
 DB_PASSWORD=your_secure_password
 DB_NAME=aiaos
 
+# ── Database Pool —— [FIXED S11]
+DB_MAX_OPEN_CONNS=25
+DB_MAX_IDLE_CONNS=10
+DB_CONN_MAX_LIFETIME=5m
+
 # ── Security ──
 JWT_SECRET=your_jwt_secret_at_least_32_chars
 ENCRYPTION_KEY=your_aes256_key_32_bytes_hex
@@ -1435,9 +1492,42 @@ server {
 }
 ```
 
----
+### 10.5 监控与健康检查 [FIXED S12]
 
-## 附录 A：Go 后端推荐依赖
+#### Phase 1（当前）
+
+| 项目 | 方案 |
+|------|------|
+| **健康检查** | `GET /healthz` 端点，检查 DB + Redis 连接状态，返回 `{"status":"ok"}` 或 `{"status":"error","details":{...}}`，无需认证 |
+| **结构化日志** | zerolog → stdout → Docker logs |
+| **请求追踪** | `X-Request-ID` 中间件，每个请求生成唯一 ID |
+
+```go
+// handler/health_handler.go
+func HealthCheck(db *pgx.Pool, rdb *redis.Client) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        dbErr := db.Ping(c)
+        redisErr := rdb.Ping(c).Err()
+        if dbErr != nil || redisErr != nil {
+            c.JSON(503, gin.H{"status": "error", "db": errStr(dbErr), "redis": errStr(redisErr)})
+            return
+        }
+        c.JSON(200, gin.H{"status": "ok"})
+    }
+}
+```
+
+#### Phase 2（后续扩展）
+
+| 项目 | 方案 |
+|------|------|
+| **Metrics** | Prometheus 中间件 + `GET /metrics` 端点 |
+| **可视化** | Grafana Dashboard |
+| **日志采集** | Loki（Docker Compose 中追加服务） |
+
+> Phase 2 根据实际运营需要再引入，不在首期开发范围。
+
+---
 
 | 库 | 用途 | 选型理由 |
 |----|------|----------|
